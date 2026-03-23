@@ -30,6 +30,15 @@ cd /path/to/oceansim/utils
 python3 ros2_image_subscriber.py
 ```
 
+### GPU-first ROS2 publishing (UW camera + imaging sonar)
+OceanSim now supports GPU-first publication for the processed underwater camera image and imaging sonar fan image. The publishing path uses the ROS2 bridge `ROS2PublishImage` node with `dataPtr` + `cudaDeviceIndex`, so no per-frame CPU copies are required.
+
+What changed:
+- **UW_Camera**: processed image can be published from a preallocated GPU buffer (`dataPtr`) with a consistent `bufferSize`, `width`, `height`, and `encoding`.
+- **ImagingSonarSensor**: the fan image is produced on GPU and published from a preallocated GPU RGBA buffer.
+- **Helper**: `isaacsim/oceansim/pipeline/ros2_graphs.py` provides a small builder to create the ROS2 image graph and set the correct inputs for GPU publishing.
+
+These paths are designed to avoid per-frame `annotator.get_data()` polling and reduce Python/Numpy churn in the main loop.
+
 ## Acknowledgement:
 Great appreciation to [Tang-JingWei](https://github.com/Tang-JingWei) for contributng the ros bridge example for OceanSim.
-

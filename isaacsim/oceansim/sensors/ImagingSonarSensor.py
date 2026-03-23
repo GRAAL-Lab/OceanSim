@@ -5,6 +5,51 @@ import numpy as np
 from omni.replicator.core.scripts.functional import write_np
 import warp as wp
 from isaacsim.oceansim.utils.ImagingSonar_kernels import *
+from isaacsim.oceansim.pipeline.ros2_graphs import create_ros2_image_graph
+
+
+@wp.kernel
+def _sonar_fan_rgba(
+    src: wp.array(ndim=3, dtype=wp.uint8),
+    dst: wp.array(ndim=3, dtype=wp.uint8),
+    half_fov_rad: float,
+    min_radius_norm: float,
+):
+    i, j = wp.tid()
+    dst_h = dst.shape[0]
+    dst_w = dst.shape[1]
+    src_h = src.shape[0]
+    src_w = src.shape[1]
+
+    x = wp.float32(j)
+    y = wp.float32(i)
+    cx = wp.float32(dst_w - 1) * 0.5
+    cy = wp.float32(dst_h - 1)
+    dx = x - cx
+    dy = cy - y
+
+    valid = False
+    if dy >= 0.0:
+        theta = wp.atan2(dx, wp.max(dy, wp.float32(1.0e-6)))
+        radius_norm = wp.sqrt(dx * dx + dy * dy) / wp.max(cy, wp.float32(1.0))
+        if (
+            wp.abs(theta) <= half_fov_rad
+            and radius_norm >= min_radius_norm
+            and radius_norm <= 1.0
+        ):
+            theta_norm = (theta + half_fov_rad) / wp.max(2.0 * half_fov_rad, wp.float32(1.0e-6))
+            radius_scaled = (radius_norm - min_radius_norm) / wp.max(1.0 - min_radius_norm, wp.float32(1.0e-6))
+            src_j = wp.min(wp.int32(theta_norm * wp.float32(src_w - 1) + 0.5), src_w - 1)
+            src_i = wp.min(wp.int32(radius_scaled * wp.float32(src_h - 1) + 0.5), src_h - 1)
+            for c in range(4):
+                dst[i, j, c] = src[src_i, src_j, c]
+            valid = True
+
+    if not valid:
+        dst[i, j, 0] = wp.uint8(0)
+        dst[i, j, 1] = wp.uint8(0)
+        dst[i, j, 2] = wp.uint8(0)
+        dst[i, j, 3] = wp.uint8(255)
 
 
 # Future TODO
@@ -106,6 +151,7 @@ class ImagingSonarSensor(Camera):
         self.sonar_image = wp.zeros(shape=(self.r.shape[0], self.r.shape[1], 4), dtype=wp.uint8)
         self.gau_noise = wp.zeros(shape=self.r.shape, dtype=wp.float32)
         self.range_dependent_ray_noise = wp.zeros(shape=self.r.shape, dtype=wp.float32)
+        self._fan_rgba_buffer = None
 
         self.AR = self.hori_fov / self.vert_fov
         self.vert_res = int(self.hori_res / self.AR)
@@ -155,7 +201,14 @@ class ImagingSonarSensor(Camera):
     # Can be set to False to gain performance if the data is 
     # expected to be used immediately within the writer. Defaults to True.
 
-    def sonar_initialize(self, output_dir : str = None, viewport: bool = True, include_unlabelled = False, if_array_copy: bool = True):
+    def sonar_initialize(
+        self,
+        output_dir: str = None,
+        viewport: bool = True,
+        include_unlabelled=False,
+        if_array_copy: bool = True,
+        fetch_on_device: bool = False,
+    ):
         """Initialize sonar data processing pipeline and annotators.
     
         Args:
@@ -168,6 +221,9 @@ class ImagingSonarSensor(Camera):
                                             This is recommended for workflows using asynchronous backends to manage the data lifetime. 
                                             Can be set to False to gain performance if the data is expected to be used immediately within the writer. 
                                             Defaults to True.
+            fetch_on_device (bool, optional): If True, request Replicator pointcloud data directly
+                                            on the Warp device. Defaults to False to favor stability by
+                                            fetching on host and explicitly copying into Warp arrays.
                                             
         Note:
             - Attaches pointcloud, camera params, and semantic segmentation annotators
@@ -177,30 +233,43 @@ class ImagingSonarSensor(Camera):
         self.writing = False
         self._viewport = viewport
         self._device = str(wp.get_preferred_device())
+        self._fetch_on_device = bool(fetch_on_device)
+        annotator_device = self._device if self._fetch_on_device else "cpu"
+        self._device_array_cache = {}
+        self._index_to_prop_cache = {}
+        self._temp_array_cache = {}
         self.scan_data = {}
         self.id = 0
+        self._ros2_graph_path = None
+        self._ros2_data_attr = None
+        self._ros2_data_ptr_attr = None
+        self._ros2_buffer_size_attr = None
+        self._ros2_width_attr = None
+        self._ros2_height_attr = None
+        self._ros2_use_gpu = False
+        self._ros2_cuda_device_index = -1
 
         self.pointcloud_annot = rep.AnnotatorRegistry.get_annotator(
             name="pointcloud",
             init_params={"includeUnlabelled": include_unlabelled},
             do_array_copy=if_array_copy,
-            device=self._device
+            device=annotator_device
             )
         
         self.cameraParams_annot = rep.AnnotatorRegistry.get_annotator(
             name="CameraParams",
             do_array_copy=if_array_copy,
-            device=self._device
+            device=annotator_device
             )
         
         self.semanticSeg_annot = rep.AnnotatorRegistry.get_annotator(
             name='semantic_segmentation',
             init_params={"colorize": False},
             do_array_copy=if_array_copy,
-            device=self._device
+            device=annotator_device
         )
 
-        print(f'[{self._name}] Using {self._device}' )
+        print(f'[{self._name}] Using {self._device} (annotator fetch: {"device" if self._fetch_on_device else "host"})' )
         print(f'[{self._name}] Render query res: {self.hori_res} x {self.vert_res}. Binning res: {self.r.shape[0]} x {self.r.shape[1]}')
 
         self.pointcloud_annot.attach(self._render_product_path)
@@ -223,7 +292,194 @@ class ImagingSonarSensor(Camera):
         self.range_dependent_ray_noise.zero_()
         self.gau_noise.zero_()
 
+    def setup_ros2_publisher(
+        self,
+        topic_name: str,
+        frame_id: str,
+        ros_namespace: str,
+        queue_size: int,
+        stream_width: int,
+        stream_height: int,
+        graph_path: str | None = None,
+    ) -> None:
+        """Create a ROS2PublishImage graph for the sonar RGBA output."""
+        device_str = str(self._device)
+        self._ros2_use_gpu = device_str.startswith("cuda:")
+        if self._ros2_use_gpu:
+            self._ros2_cuda_device_index = int(device_str.split(":", 1)[1])
+        else:
+            self._ros2_cuda_device_index = -1
+
+        graph_path = graph_path or f"/ROS2{self._name}Graph"
+        attrs = create_ros2_image_graph(
+            graph_path=graph_path,
+            topic_name=topic_name,
+            frame_id=frame_id,
+            ros_namespace=ros_namespace,
+            queue_size=queue_size,
+            encoding="rgba8",
+            cuda_device_index=self._ros2_cuda_device_index,
+            width=stream_width,
+            height=stream_height,
+            buffer_size=int(stream_width * stream_height * 4),
+        )
+        self._ros2_graph_path = graph_path
+        self._ros2_data_attr = attrs["data_attr"]
+        self._ros2_data_ptr_attr = attrs["data_ptr_attr"]
+        self._ros2_buffer_size_attr = attrs["buffer_size_attr"]
+        self._ros2_width_attr = attrs["width_attr"]
+        self._ros2_height_attr = attrs["height_attr"]
+
+        if self._ros2_use_gpu:
+            if (
+                self._fan_rgba_buffer is None
+                or self._fan_rgba_buffer.shape[0] != stream_height
+                or self._fan_rgba_buffer.shape[1] != stream_width
+            ):
+                self._fan_rgba_buffer = wp.zeros(
+                    shape=(stream_height, stream_width, 4),
+                    dtype=wp.uint8,
+                    device=self._device,
+                )
+            if self._ros2_data_ptr_attr is not None:
+                self._ros2_data_ptr_attr.set(int(self._fan_rgba_buffer.ptr))
+        else:
+            if self._ros2_data_ptr_attr is not None:
+                self._ros2_data_ptr_attr.set(0)
+        if self._ros2_data_attr is not None:
+            self._ros2_data_attr.set([])
+
+    def _to_warp_array(self, data, dtype, cache_key=None):
+        """Move host-fetched annotator data onto the configured Warp device.
+
+        Replicator host fetches may return flattened buffers for vector-valued
+        outputs such as point positions and normals. Warp's vec3 constructors
+        require an inner dimension of 3, so normalize the array shape here.
+        """
+        if isinstance(data, wp.array):
+            return data
+
+        array = np.asarray(data)
+
+        if dtype in (wp.vec3, wp.vec3f):
+            if array.size == 0:
+                array = np.empty((0, 3), dtype=np.float32)
+            elif array.ndim == 1:
+                if array.size % 3 != 0:
+                    raise RuntimeError(
+                        f"Cannot convert flattened host array of length {array.size} to {dtype}: expected a multiple of 3"
+                    )
+                array = array.reshape((-1, 3))
+            elif array.shape[-1] == 4:
+                array = array[..., :3]
+            elif array.shape[-1] != 3:
+                if array.size % 3 != 0:
+                    raise RuntimeError(
+                        f"Cannot convert host array with shape {array.shape} to {dtype}: expected trailing dimension 3"
+                    )
+                array = array.reshape((-1, 3))
+            array = np.ascontiguousarray(array, dtype=np.float32)
+        elif dtype in (wp.float32,):
+            if array.size == 0:
+                array = np.empty((0, 3), dtype=np.float32)
+            elif array.ndim == 1:
+                if array.size % 3 != 0:
+                    raise RuntimeError(
+                        f"Cannot convert flattened host array of length {array.size} to float32 point array: expected a multiple of 3"
+                    )
+                array = array.reshape((-1, 3))
+            elif array.shape[-1] == 4:
+                array = array[..., :3]
+            elif array.shape[-1] != 3:
+                if array.size % 3 != 0:
+                    raise RuntimeError(
+                        f"Cannot convert host array with shape {array.shape} to float32 point array: expected trailing dimension 3"
+                    )
+                array = array.reshape((-1, 3))
+            array = np.ascontiguousarray(array, dtype=np.float32)
+        elif dtype in (wp.uint32,):
+            array = np.ascontiguousarray(array.reshape(-1), dtype=np.uint32)
+        else:
+            array = np.ascontiguousarray(array)
+
+        if cache_key is None:
+            return wp.array(array, dtype=dtype, device=self._device)
+
+        cached = self._device_array_cache.get(cache_key)
+        if cached is None or cached.shape != array.shape or cached.dtype != dtype:
+            cached = wp.empty(shape=array.shape, dtype=dtype, device=self._device)
+            self._device_array_cache[cache_key] = cached
+
+        src = wp.from_numpy(array, dtype=dtype, device="cpu")
+        wp.copy(cached, src)
+        return cached
+
+    def _get_temp_array(self, cache_key, shape, dtype):
+        cached = self._temp_array_cache.get(cache_key)
+        if cached is None or cached.shape != shape or cached.dtype != dtype:
+            cached = wp.empty(shape=shape, dtype=dtype, device=self._device)
+            self._temp_array_cache[cache_key] = cached
+        return cached
+
+    def _build_index_to_prop_key(self, id_to_labels: dict, query_property: str):
+        items = []
+        for id_key in sorted(id_to_labels.keys(), key=lambda x: int(x)):
+            labels = id_to_labels.get(id_key, {})
+            items.append((str(id_key), labels.get(query_property, 1.0)))
+        return query_property, tuple(items)
+
+    def _get_index_to_prop_array(self, id_to_labels: dict, query_property: str):
+        cache_key = self._build_index_to_prop_key(id_to_labels, query_property)
+        cached = self._index_to_prop_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        max_id = max(id_to_labels.keys(), default=-1)
+        index_to_prop_array = np.ones((int(max_id) + 1,), dtype=np.float32)
+        for id_key, labels in id_to_labels.items():
+            if query_property in labels:
+                index_to_prop_array[int(id_key)] = labels[query_property]
+
+        cached = wp.from_numpy(index_to_prop_array, dtype=wp.float32, device=self._device)
+        self._index_to_prop_cache = {cache_key: cached}
+        return cached
+
         
+    def _fetch_scan_frame(self):
+        """Fetch a single consistent annotator snapshot for the current frame.
+
+        The sonar processing path consumes pointcloud, semantic, and camera-parameter
+        data from Replicator. Fetching the same annotator repeatedly within one scan
+        causes unnecessary cache reshaping/copies and makes the frame lifetime harder
+        to reason about. Consolidating the fetch here keeps the public API unchanged
+        while ensuring each scan reuses one snapshot per annotator.
+        """
+        semantic_frame = self.semanticSeg_annot.get_data()
+        id_to_labels = semantic_frame.get('info', {}).get('idToLabels', {})
+        if len(id_to_labels) == 0:
+            return None
+
+        if self._fetch_on_device:
+            pointcloud_frame = self.pointcloud_annot.get_data(device=self._device)
+            pcl = pointcloud_frame['data']
+            normals = pointcloud_frame['info']['pointNormals']
+            semantics = pointcloud_frame['info']['pointSemantic']
+        else:
+            pointcloud_frame = self.pointcloud_annot.get_data()
+            pcl = self._to_warp_array(pointcloud_frame['data'], wp.float32, cache_key="pcl")
+            normals = self._to_warp_array(pointcloud_frame['info']['pointNormals'], wp.float32, cache_key="normals")
+            semantics = self._to_warp_array(
+                pointcloud_frame['info']['pointSemantic'], wp.uint32, cache_key="semantics"
+            )
+
+        camera_params_frame = self.cameraParams_annot.get_data()
+        return {
+            'pcl': pcl,
+            'normals': normals,
+            'semantics': semantics,
+            'viewTransform': camera_params_frame['cameraViewTransform'].reshape(4, 4).T,
+            'idToLabels': id_to_labels,
+        }
 
     def scan(self):
 
@@ -239,16 +495,13 @@ class ImagingSonarSensor(Camera):
         """
         # Due to the time to load annotator to cuda, the first few simulation tick gives no annotation in memory.
         # This would also reult error when no mesh within the sonar fov
-        # NOTE: Isaac Sim annotator output has squeezed the first dimention after 5.0 update: (1,N,3) -> (N,3)   
-        if len(self.semanticSeg_annot.get_data()['info']['idToLabels']) !=0:
-            self.scan_data['pcl'] = self.pointcloud_annot.get_data(device=self._device)['data']  # shape :(N,3) <class 'warp.types.array'>
-            self.scan_data['normals'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointNormals'] # shape :(N,4) <class 'warp.types.array'>
-            self.scan_data['semantics'] = self.pointcloud_annot.get_data(device=self._device)['info']['pointSemantic'] # shape: (N) <class 'warp.types.array'>
-            self.scan_data['viewTransform'] = self.cameraParams_annot.get_data()['cameraViewTransform'].reshape(4,4).T # 4 by 4 np.ndarray extrinsic matrix
-            self.scan_data['idToLabels'] = self.semanticSeg_annot.get_data()['info']['idToLabels'] # dict 
-            return True
-        else:
+        # NOTE: Isaac Sim annotator output has squeezed the first dimention after 5.0 update: (1,N,3) -> (N,3)
+        scan_frame = self._fetch_scan_frame()
+        if scan_frame is None:
+            self.scan_data.clear()
             return False
+        self.scan_data = scan_frame
+        return True
 
 
     def make_sonar_data(self, 
@@ -284,27 +537,12 @@ class ImagingSonarSensor(Camera):
 
 
 
-        def make_indexToProp_array(idToLabels: dict, query_property: str):
-            # A utility function helps to convert idToLabels into indexToProp array
-            # This manipulation facilitates warp computation framework
-            # indexToProp is an 1-dim array where the values associated with the query property 
-            # are placed at the index corresponding to the key
-            # First two entry are always zero because {'0': {'class': 'BACKGROUND'}, '1': {'class': 'UNLABELLED'}}
-            # eg: indexToProp = [0, 0, 0.1, 1 .....] 
-            max_id = max(idToLabels.keys(), default=-1)
-            indexToProp_array = np.ones((int(max_id)+1,))
-            for id in idToLabels.keys():
-                for property in idToLabels.get(id):
-                    if property == query_property:
-                        indexToProp_array[int(id)] = idToLabels.get(id).get(property)
-            return indexToProp_array
-
         if self.scan():
             num_points = self.scan_data['pcl'].shape[0]
-            # Load these small numpy arrays to cuda
-            indexToRefl = wp.array(make_indexToProp_array(idToLabels=self.scan_data['idToLabels'],
-                                                         query_property=query_prop),
-                                                         dtype=wp.float32)
+            indexToRefl = self._get_index_to_prop_array(
+                id_to_labels=self.scan_data['idToLabels'],
+                query_property=query_prop,
+            )
             viewTransform=wp.mat44(self.scan_data['viewTransform'])
             # directly use warp array loaded on cuda
             pcl = self.scan_data['pcl']
@@ -314,7 +552,7 @@ class ImagingSonarSensor(Camera):
             return
 
         # Compute intensity for each ray query     
-        intensity = wp.empty(shape=(num_points,), dtype=wp.float32)
+        intensity = self._get_temp_array("intensity", (num_points,), wp.float32)
         wp.launch(kernel=compute_intensity,
                   dim=num_points,
                   inputs=[
@@ -331,8 +569,8 @@ class ImagingSonarSensor(Camera):
                 )
                 
         # Transform pointcloud from world cooridates to sonar local
-        pcl_local =wp.empty(shape=(num_points,), dtype=wp.vec3)
-        pcl_spher = wp.empty(shape=(num_points,), dtype=wp.vec3)
+        pcl_local = self._get_temp_array("pcl_local", (num_points,), wp.vec3)
+        pcl_spher = self._get_temp_array("pcl_spher", (num_points,), wp.vec3)
         wp.launch(kernel=world2local,
                   dim=num_points,
                   inputs=[
@@ -430,7 +668,8 @@ class ImagingSonarSensor(Camera):
         # Normalizing intensity at each bin either by global maximum or rangewise maximum
         # Compute global maximum
         if normalizing_method == "all":
-            maximum = wp.zeros(shape=(1,), dtype=wp.float32)
+            maximum = self._get_temp_array("maximum_all", (1,), wp.float32)
+            maximum.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=all_max,
@@ -463,7 +702,8 @@ class ImagingSonarSensor(Camera):
             
         if normalizing_method == "range":
             # Compute rangewise maximum
-            maximum = wp.zeros(shape=(self.r.shape[0],), dtype=wp.float32)
+            maximum = self._get_temp_array("maximum_range", (self.r.shape[0],), wp.float32)
+            maximum.zero_()
             wp.launch(
                 dim=self.bin_sum.shape,
                 kernel=range_max,
@@ -531,6 +771,106 @@ class ImagingSonarSensor(Camera):
             ]
         )
         return self.sonar_image
+
+    def render_rgba(self, **kwargs):
+        """Run one sonar processing step and return the resulting RGBA image.
+
+        Keyword arguments are forwarded to ``make_sonar_data`` so callers can
+        configure processing without reaching into lower-level internals.
+        """
+        self.make_sonar_data(**kwargs)
+        return self.make_sonar_image()
+
+    def render_fan_rgba(
+        self,
+        stream_width: int,
+        stream_height: int,
+        min_range_m: float,
+        max_range_m: float,
+        horizontal_fov_deg: float,
+        **kwargs,
+    ) -> wp.array:
+        """Render a sonar frame and map it into a fan-shaped RGBA image."""
+        sonar_rgba = self.render_rgba(**kwargs)
+        if sonar_rgba is None:
+            return None
+
+        if (
+            self._fan_rgba_buffer is None
+            or self._fan_rgba_buffer.shape[0] != stream_height
+            or self._fan_rgba_buffer.shape[1] != stream_width
+        ):
+            self._fan_rgba_buffer = wp.zeros(
+                shape=(stream_height, stream_width, 4),
+                dtype=wp.uint8,
+                device=self._device,
+            )
+        else:
+            self._fan_rgba_buffer.zero_()
+
+        half_fov_rad = 0.5 * np.deg2rad(float(horizontal_fov_deg))
+        min_radius_norm = 0.0
+        if max_range_m > min_range_m and min_range_m > 0.0:
+            min_radius_norm = float(np.clip(min_range_m / max_range_m, 0.0, 0.99))
+
+        wp.launch(
+            dim=(stream_height, stream_width),
+            kernel=_sonar_fan_rgba,
+            inputs=[
+                sonar_rgba,
+                self._fan_rgba_buffer,
+                half_fov_rad,
+                min_radius_norm,
+            ],
+        )
+        return self._fan_rgba_buffer
+
+    def publish_rgba(self, rgba_image: wp.array, stream_width: int, stream_height: int) -> None:
+        """Publish an RGBA sonar frame to ROS2 using host data."""
+        if (
+            rgba_image is None
+            or self._ros2_data_attr is None
+            or self._ros2_buffer_size_attr is None
+        ):
+            return
+        if self._ros2_width_attr is not None:
+            self._ros2_width_attr.set(int(stream_width))
+        if self._ros2_height_attr is not None:
+            self._ros2_height_attr.set(int(stream_height))
+        if self._ros2_use_gpu:
+            # Ensure GPU kernels complete before ROS2 reads the pointer.
+            wp.synchronize()
+            self._ros2_buffer_size_attr.set(int(stream_width * stream_height * 4))
+            if self._ros2_data_ptr_attr is not None:
+                self._ros2_data_ptr_attr.set(int(rgba_image.ptr))
+            self._ros2_data_attr.set([])
+            return
+        rgba_host = rgba_image.numpy()
+        self._ros2_buffer_size_attr.set(int(rgba_host.size))
+        self._ros2_data_attr.set(rgba_host.reshape(-1))
+
+    def step_render_publish(
+        self,
+        stream_width: int,
+        stream_height: int,
+        min_range_m: float,
+        max_range_m: float,
+        horizontal_fov_deg: float,
+        **kwargs,
+    ) -> bool:
+        """Render a sonar frame and publish it to ROS2."""
+        rgba_image = self.render_fan_rgba(
+            stream_width=stream_width,
+            stream_height=stream_height,
+            min_range_m=min_range_m,
+            max_range_m=max_range_m,
+            horizontal_fov_deg=horizontal_fov_deg,
+            **kwargs,
+        )
+        if rgba_image is None:
+            return False
+        self.publish_rgba(rgba_image, stream_width, stream_height)
+        return True
     
 
     def make_sonar_viewport(self):
