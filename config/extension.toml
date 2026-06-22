@@ -15,18 +15,16 @@ readme = "docs/README.md"
 preview_image = "data/preview.png"
 icon = "data/icon.png"
 
-
 [dependencies]
 "omni.kit.uiapp" = {}
 "omni.isaac.ui" = {}
 "omni.isaac.core" = {}
 
-
+# Register the OceanSim Python package so imports like
+# isaacsim.oceansim.sensors.DVLsensor work.
 [[python.module]]
-name = "isaacsim.oceansim.modules.SensorExample_python"
+name = "isaacsim.oceansim"
 
-[[python.module]]
-name = "isaacsim.oceansim.modules.colorpicker_python"
-
-
-
+# Disabled: this module is referenced by gpu-ros2-publish but does not exist.
+# [[python.module]]
+# name = "isaacsim.oceansim.modules.bridge_stub"
