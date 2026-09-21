@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 import omni.graph.core as og
+import omni.kit.commands
+import omni.usd
 
 
 def create_ros2_image_graph(
@@ -23,6 +25,12 @@ def create_ros2_image_graph(
 
     Returns the graph, publish impulse, and image input attribute handles.
     """
+    stage = omni.usd.get_context().get_stage()
+    if stage is not None and stage.GetPrimAtPath(graph_path).IsValid():
+        # A saved scene may still contain the former OnPlaybackTick graph. Editing
+        # it in place leaves that trigger connected and republishes stale frames.
+        omni.kit.commands.execute("DeletePrims", paths=[graph_path])
+
     keys = og.Controller.Keys
     og.Controller.edit(
         {"graph_path": graph_path, "evaluator_name": "execution"},

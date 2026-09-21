@@ -82,9 +82,7 @@ class UW_Camera(Camera):
         self._processed_height_attr = None
         self._processed_use_gpu = False
         self._processed_cuda_device_index = -1
-        self._source_reference_time = None
         self._source_rendering_time = None
-        self._last_published_reference_time = None
         self._last_published_rendering_time = None
 
         super().__init__(prim_path, name, frequency, dt, resolution, position, orientation, translation, render_product_path)
@@ -225,8 +223,7 @@ class UW_Camera(Camera):
         denominator = int(frame_time.get("referenceTimeDenominator", 0))
         if numerator <= 0 or denominator <= 0:
             return None
-        self._source_reference_time = (numerator, denominator)
-        rendering_time = self._core_nodes_interface.get_sim_time_at_time(self._source_reference_time)
+        rendering_time = self._core_nodes_interface.get_sim_time_at_time((numerator, denominator))
         self._source_rendering_time = int(round(float(rendering_time) * 1e9)) * 1e-9
 
         if self._uw_image_buffer is None or self._uw_image_buffer.shape != raw_rgba.shape:
@@ -325,7 +322,10 @@ class UW_Camera(Camera):
         if self._processed_graph is None or self._processed_publish_impulse_attr is None:
             return False
         self._processed_publish_impulse_attr.set(True)
-        og.Controller.evaluate_sync(self._processed_graph)
+        try:
+            og.Controller.evaluate_sync(self._processed_graph)
+        finally:
+            self._processed_publish_impulse_attr.set(False)
         return True
 
     def step_processed(self) -> float | None:
@@ -335,12 +335,8 @@ class UW_Camera(Camera):
             if uw_image is None or self._uw_rgb_buffer is None:
                 return None
             if (
-                self._source_reference_time == self._last_published_reference_time
-                or self._source_rendering_time is None
-                or (
-                    self._last_published_rendering_time is not None
-                    and self._source_rendering_time <= self._last_published_rendering_time
-                )
+                self._source_rendering_time is None
+                or self._source_rendering_time <= (self._last_published_rendering_time or 0.0)
             ):
                 return None
             # Ensure GPU kernels complete before ROS2 reads the pointer.
@@ -359,7 +355,6 @@ class UW_Camera(Camera):
                 self._processed_timestamp_attr.set(self._source_rendering_time)
             if not self._trigger_processed_publish():
                 return None
-            self._last_published_reference_time = self._source_reference_time
             self._last_published_rendering_time = self._source_rendering_time
             return self._source_rendering_time
 
@@ -367,12 +362,8 @@ class UW_Camera(Camera):
         if frame_rgb is None:
             return None
         if (
-            self._source_reference_time == self._last_published_reference_time
-            or self._source_rendering_time is None
-            or (
-                self._last_published_rendering_time is not None
-                and self._source_rendering_time <= self._last_published_rendering_time
-            )
+            self._source_rendering_time is None
+            or self._source_rendering_time <= (self._last_published_rendering_time or 0.0)
         ):
             return None
         self.publish_processed_frame(frame_rgb)
@@ -380,7 +371,6 @@ class UW_Camera(Camera):
             self._processed_timestamp_attr.set(self._source_rendering_time)
         if not self._trigger_processed_publish():
             return None
-        self._last_published_reference_time = self._source_reference_time
         self._last_published_rendering_time = self._source_rendering_time
         return self._source_rendering_time
 
