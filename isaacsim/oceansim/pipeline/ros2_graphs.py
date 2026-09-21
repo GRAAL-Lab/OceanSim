@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import omni.graph.core as og
 
@@ -18,24 +18,22 @@ def create_ros2_image_graph(
     width: Optional[int] = None,
     height: Optional[int] = None,
     buffer_size: Optional[int] = None,
-) -> Dict[str, og.Attribute]:
+) -> Dict[str, Any]:
     """Create a ROS2PublishImage graph and return attribute handles.
 
-    Returns keys: data_attr, buffer_size_attr, width_attr, height_attr, data_ptr_attr.
+    Returns the graph, publish impulse, and image input attribute handles.
     """
     keys = og.Controller.Keys
     og.Controller.edit(
         {"graph_path": graph_path, "evaluator_name": "execution"},
         {
             keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                ("PublishImpulse", "omni.graph.action.OnImpulseEvent"),
                 ("ROS2Context", "isaacsim.ros2.bridge.ROS2Context"),
                 ("PublishImage", "isaacsim.ros2.bridge.ROS2PublishImage"),
             ],
             keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "PublishImage.inputs:execIn"),
-                ("ReadSimTime.outputs:simulationTime", "PublishImage.inputs:timeStamp"),
+                ("PublishImpulse.outputs:execOut", "PublishImage.inputs:execIn"),
                 ("ROS2Context.outputs:context", "PublishImage.inputs:context"),
             ],
             keys.SET_VALUES: [
@@ -49,6 +47,10 @@ def create_ros2_image_graph(
         },
     )
 
+    graph = og.Controller.graph(graph_path)
+    graph.change_pipeline_stage(og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_ONDEMAND)
+    publish_impulse_attr = og.Controller.attribute(f"{graph_path}/PublishImpulse.state:enableImpulse")
+    timestamp_attr = og.Controller.attribute(f"{graph_path}/PublishImage.inputs:timeStamp")
     data_attr = og.Controller.attribute(f"{graph_path}/PublishImage.inputs:data")
     data_ptr_attr = og.Controller.attribute(f"{graph_path}/PublishImage.inputs:dataPtr")
     buffer_size_attr = og.Controller.attribute(f"{graph_path}/PublishImage.inputs:bufferSize")
@@ -63,6 +65,9 @@ def create_ros2_image_graph(
         buffer_size_attr.set(int(buffer_size))
 
     return {
+        "graph": graph,
+        "publish_impulse_attr": publish_impulse_attr,
+        "timestamp_attr": timestamp_attr,
         "data_attr": data_attr,
         "data_ptr_attr": data_ptr_attr,
         "buffer_size_attr": buffer_size_attr,
